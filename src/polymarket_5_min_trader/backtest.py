@@ -19,6 +19,7 @@ from polymarket_5_min_trader.strategy import (
 
 BACKTEST_ONLY_STRATEGIES = {
     "late_leader_60s": 60,
+    "late_leader_45s": 45,
     "late_leader_30s": 30,
     "late_leader_15s": 15,
     "late_leader_5s": 5,
