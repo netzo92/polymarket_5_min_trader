@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "polymarket-5-min-trader"
+version = "0.1.0"
+description = "A dry-run-first Polymarket short-expiry trading bot."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "eth-abi==6.0.0b1",
+  "eth-utils==6.0.0",
+  "py-clob-client==0.34.6",
+  "py-builder-relayer-client==0.0.1",
+  "py-builder-signing-sdk==0.0.2",
+  "python-dotenv==1.1.1",
+  "requests==2.32.5",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest==9.0.2",
+]
+
+[project.scripts]
+polymarket-5m-bot = "polymarket_5_min_trader.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

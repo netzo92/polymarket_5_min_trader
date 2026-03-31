@@ -1,0 +1,17 @@
+Metadata-Version: 2.4
+Name: polymarket-5-min-trader
+Version: 0.1.0
+Summary: A dry-run-first Polymarket short-expiry trading bot.
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: eth-abi==6.0.0b1
+Requires-Dist: eth-utils==6.0.0
+Requires-Dist: py-clob-client==0.34.6
+Requires-Dist: py-builder-relayer-client==0.0.1
+Requires-Dist: py-builder-signing-sdk==0.0.2
+Requires-Dist: python-dotenv==1.1.1
+Requires-Dist: requests==2.32.5
+Provides-Extra: dev
+Requires-Dist: pytest==9.0.2; extra == "dev"
+
+# polymarket_5_min_trader

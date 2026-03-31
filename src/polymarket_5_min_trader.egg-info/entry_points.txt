@@ -1,0 +1,2 @@
+[console_scripts]
+polymarket-5m-bot = polymarket_5_min_trader.cli:main
