@@ -396,6 +396,8 @@ def _simulate_late_leader_market(
     )
     if observed_entry_price <= 0:
         return None
+    if observed_entry_price > 0.95:
+        return None
 
     if execution_delay_seconds > 0:
         fill = _find_first_fill_after(
