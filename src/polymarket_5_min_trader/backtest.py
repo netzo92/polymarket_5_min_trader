@@ -419,6 +419,9 @@ def _simulate_late_leader_market(
     if settlement_price is None:
         return None
 
+    confidence_scale = min(2.0, max(0.5, observed_entry_price / 0.70))
+    scaled_amount = config.order_amount * confidence_scale
+
     return _settle_trade(
         market=market,
         strategy_name=strategy_name,
@@ -429,7 +432,7 @@ def _simulate_late_leader_market(
         observed_entry_price=observed_entry_price,
         entry_price=entry_price,
         settlement_price=settlement_price,
-        amount=config.order_amount,
+        amount=scaled_amount,
         polygon_gas_cost_usdc=polygon_gas_cost_usdc,
         score=entry_price,
     )
