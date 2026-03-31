@@ -2,5 +2,12 @@
 __pycache__/
 .pytest_cache/
 *.pyc
+
+# Runtime artifacts
 data/
+logs/
+*.log
+*.log.*
+
 .env
+autoresearch-results.tsv

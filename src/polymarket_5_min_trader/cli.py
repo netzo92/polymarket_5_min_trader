@@ -9,7 +9,7 @@ import shutil
 import sys
 import time
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from decimal import ROUND_DOWN, Decimal
 from logging.handlers import TimedRotatingFileHandler
@@ -43,7 +43,7 @@ from polymarket_5_min_trader.strategy import (
 )
 
 LOGGER = logging.getLogger(__name__)
-NOISY_LOGGERS = ("urllib3", "httpcore", "httpx", "hpack")
+NOISY_LOGGERS = ("urllib3", "httpcore", "httpx", "hpack", "RelayClient")
 USD_CENT = Decimal("0.01")
 PERCENT_DENOMINATOR = Decimal("100")
 DEFAULT_RESEARCH_DIR = Path("data/research")
@@ -54,10 +54,32 @@ DEFAULT_RESEARCH_FIDELITY = 1
 DEFAULT_EXEC_DELAY = 0
 DEFAULT_SLIPPAGE_CENTS = 0.0
 DEFAULT_GAS_COST = 0.0
+COMMAND_LOG_PATHS: dict[str, Path] = {
+    "run": Path("data/bot.log"),
+    "run-once": Path("data/bot.log"),
+    "doctor": Path("data/doctor.log"),
+    "download-history": Path("data/download-history.log"),
+    "backtest": Path("data/backtest.log"),
+    "compare-strategies": Path("data/compare-strategies.log"),
+    "execution-grid": Path("data/execution-grid.log"),
+    "autoresearch": Path("data/autoresearch.log"),
+}
 
 
 class StrategyGuardTriggered(RuntimeError):
     """Raised when recent settled trades violate the configured guardrail."""
+
+
+@dataclass(frozen=True)
+class SessionStats:
+    trades: int = 0
+    wins: int = 0
+    losses: int = 0
+    open_trades: int = 0
+    pending_trades: int = 0
+    no_match_trades: int = 0
+    claim_pending: int = 0
+    realized_pnl: float = 0.0
 
 
 def _load_research_tools():
@@ -75,11 +97,211 @@ def _load_research_tools():
     return run_autoresearch, format_report, save_report
 
 
+def _cycle_sleep_seconds(
+    *,
+    started_at_monotonic: float,
+    interval_seconds: int,
+    ended_at_monotonic: float | None = None,
+) -> float:
+    ended = time.monotonic() if ended_at_monotonic is None else ended_at_monotonic
+    return max(0.0, interval_seconds - (ended - started_at_monotonic))
+
+
 def _format_decimal(value: object, *, places: int = 6) -> str:
     if not isinstance(value, Decimal):
         return str(value)
     text = f"{value:.{places}f}"
     return text.rstrip("0").rstrip(".")
+
+
+def _as_float(value: object) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, Decimal):
+        return float(value)
+    try:
+        text = str(value).strip()
+        if not text:
+            return None
+        return float(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def _format_signed_dollars(value: float) -> str:
+    sign = "+" if value >= 0 else "-"
+    return f"{sign}${abs(value):.2f}"
+
+
+def _trade_cost_usdc(trade: dict[str, object]) -> float | None:
+    filled_cost = _as_float(trade.get("filled_cost_usdc"))
+    if filled_cost is not None:
+        return filled_cost
+    return _as_float(trade.get("requested_amount_usdc"))
+
+
+def _trade_shares(trade: dict[str, object]) -> float | None:
+    filled_shares = _as_float(trade.get("filled_shares"))
+    if filled_shares is not None:
+        return filled_shares
+
+    cost = _trade_cost_usdc(trade)
+    entry_price = _as_float(trade.get("average_entry_price")) or _as_float(trade.get("entry_price"))
+    if cost is None or entry_price is None or entry_price <= 0:
+        return None
+    return cost / entry_price
+
+
+def _trade_realized_pnl(trade: dict[str, object]) -> float | None:
+    if trade.get("mode") != "live":
+        return None
+
+    settlement_price = _as_float(trade.get("settlement_price"))
+    cost = _trade_cost_usdc(trade)
+    if settlement_price is None or cost is None:
+        return None
+    if settlement_price <= 0:
+        return -cost
+
+    shares = _trade_shares(trade)
+    if shares is None:
+        return None
+    return (shares * settlement_price) - cost
+
+
+def _summarize_session(state) -> SessionStats:
+    stats = SessionStats()
+    for trade in state.recent_trades:
+        mode = str(trade.get("mode") or "")
+        if mode == "live":
+            stats = SessionStats(
+                trades=stats.trades + 1,
+                wins=stats.wins + (1 if trade.get("result") == "win" else 0),
+                losses=stats.losses + (1 if trade.get("result") == "loss" else 0),
+                open_trades=stats.open_trades + (1 if not trade.get("settled_at") else 0),
+                pending_trades=stats.pending_trades,
+                no_match_trades=stats.no_match_trades,
+                claim_pending=stats.claim_pending
+                + (1 if trade.get("claim_state") == "submitted" else 0),
+                realized_pnl=stats.realized_pnl + (_trade_realized_pnl(trade) or 0.0),
+            )
+        elif mode == "live-pending":
+            stats = SessionStats(
+                trades=stats.trades,
+                wins=stats.wins,
+                losses=stats.losses,
+                open_trades=stats.open_trades,
+                pending_trades=stats.pending_trades + 1,
+                no_match_trades=stats.no_match_trades,
+                claim_pending=stats.claim_pending,
+                realized_pnl=stats.realized_pnl,
+            )
+        elif mode == "live-no-match":
+            stats = SessionStats(
+                trades=stats.trades,
+                wins=stats.wins,
+                losses=stats.losses,
+                open_trades=stats.open_trades,
+                pending_trades=stats.pending_trades,
+                no_match_trades=stats.no_match_trades + 1,
+                claim_pending=stats.claim_pending,
+                realized_pnl=stats.realized_pnl,
+            )
+    return stats
+
+
+def _log_session_status(state) -> None:
+    stats = _summarize_session(state)
+    parts = [
+        f"trades={stats.trades}",
+        f"wins={stats.wins}",
+        f"losses={stats.losses}",
+        f"open={stats.open_trades}",
+    ]
+    if stats.pending_trades:
+        parts.append(f"pending={stats.pending_trades}")
+    if stats.no_match_trades:
+        parts.append(f"no_match={stats.no_match_trades}")
+    if stats.claim_pending:
+        parts.append(f"claim_pending={stats.claim_pending}")
+    parts.append(f"pnl={_format_signed_dollars(stats.realized_pnl)}")
+    LOGGER.info("Session | %s", " ".join(parts))
+
+
+def _trade_label(*, question: object, outcome: object, strategy_name: object | None = None) -> str:
+    label = f"{question} / {outcome}"
+    if strategy_name:
+        return f"[{strategy_name}] {label}"
+    return label
+
+
+def _log_trade_opened(
+    *,
+    signal: TradeSignal,
+    response: dict[str, object],
+    state,
+) -> None:
+    filled_cost = _as_float(response.get("makingAmount"))
+    filled_shares = _as_float(response.get("takingAmount"))
+    avg_price = None
+    if filled_cost is not None and filled_shares is not None and filled_shares > 0:
+        avg_price = filled_cost / filled_shares
+
+    detail_parts: list[str] = []
+    if filled_cost is not None:
+        detail_parts.append(f"cost=${filled_cost:.2f}")
+    if filled_shares is not None:
+        detail_parts.append(f"shares={filled_shares:.6f}")
+    if avg_price is not None:
+        detail_parts.append(f"avg={avg_price:.3f}")
+
+    LOGGER.info(
+        "Trade opened | %s%s",
+        _trade_label(
+            question=signal.question,
+            outcome=signal.outcome,
+            strategy_name=signal.strategy_name,
+        ),
+        f" | {' '.join(detail_parts)}" if detail_parts else "",
+    )
+    _log_session_status(state)
+
+
+def _log_trade_result(
+    *,
+    trade: dict[str, object],
+    state,
+) -> None:
+    pnl = _trade_realized_pnl(trade)
+    detail = f" | pnl={_format_signed_dollars(pnl)}" if pnl is not None else ""
+    LOGGER.info(
+        "Result | %s | %s%s",
+        str(trade.get("result") or "").upper(),
+        _trade_label(
+            question=trade.get("question", trade.get("condition_id")),
+            outcome=trade.get("outcome", trade.get("token_id")),
+            strategy_name=trade.get("strategy_name"),
+        ),
+        detail,
+    )
+    _log_session_status(state)
+
+
+def _log_runtime_banner(config: BotConfig) -> None:
+    LOGGER.info(
+        "Bot started | strategy=%s window=%s scan=%ss sizing=%s",
+        config.strategy_name,
+        _describe_strategy_window(config),
+        config.scan_interval_seconds,
+        _describe_order_sizing(config),
+    )
+    try:
+        state = BotStateStore(config.state_path).load()
+    except Exception:  # noqa: BLE001
+        return
+    _log_session_status(state)
 
 
 def _compressed_log_name(default_name: str) -> str:
@@ -93,6 +315,17 @@ def _gzip_rotated_log(source: str, dest: str) -> None:
     os.remove(source)
 
 
+def _resolve_command_log_path(
+    *,
+    command: str,
+    configured_log_path: Path,
+    explicit_override: bool,
+) -> Path:
+    if explicit_override:
+        return configured_log_path
+    return COMMAND_LOG_PATHS.get(command, configured_log_path)
+
+
 def configure_logging(
     verbose: bool,
     *,
@@ -100,6 +333,8 @@ def configure_logging(
     log_backup_count: int,
 ) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
     file_handler = TimedRotatingFileHandler(
         log_path,
         when="midnight",
@@ -107,6 +342,7 @@ def configure_logging(
         backupCount=max(1, log_backup_count),
         encoding="utf-8",
     )
+    file_handler.setLevel(logging.DEBUG if verbose else logging.INFO)
     file_handler.suffix = "%Y-%m-%d"
     file_handler.namer = _compressed_log_name
     file_handler.rotator = _gzip_rotated_log
@@ -114,7 +350,7 @@ def configure_logging(
         level=logging.DEBUG if verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         handlers=[
-            logging.StreamHandler(),
+            console_handler,
             file_handler,
         ],
         force=True,
@@ -455,7 +691,7 @@ def execute_cycle(config: BotConfig) -> int:
         now=now,
         strategy_name=config.strategy_name,
     )
-    LOGGER.info(
+    LOGGER.debug(
         "Loaded %s active BTC up/down 5m markets, %s are inside the current %s window.",
         len(markets),
         len(tradeable_markets),
@@ -494,11 +730,13 @@ def execute_cycle(config: BotConfig) -> int:
         ),
         None,
     )
+    markets_by_condition = {market.condition_id: market for market in tradeable_markets}
 
     if chosen_signal is None:
-        LOGGER.info("No eligible trade signal this cycle.")
+        LOGGER.debug("No eligible trade signal this cycle.")
         state_store.save(state)
         return 0
+    chosen_market = markets_by_condition.get(chosen_signal.condition_id)
 
     order_amount = Decimal(str(config.order_amount))
     trader: TradingClobClient | None = None
@@ -512,7 +750,7 @@ def execute_cycle(config: BotConfig) -> int:
                 f"collateral balance for POLYMARKET_ORDER_SIZE_PCT={config.order_size_pct:.2f}."
             )
         order_amount = resolved_amount
-        LOGGER.info(
+        LOGGER.debug(
             "Order sizing | target=%.2f%% of collateral balance=%s -> amount=$%.2f",
             config.order_size_pct,
             _format_decimal(collateral_status.get("balance")),
@@ -537,6 +775,10 @@ def execute_cycle(config: BotConfig) -> int:
             question=chosen_signal.question,
             outcome=chosen_signal.outcome,
             strategy_name=chosen_signal.strategy_name,
+            market_slug=chosen_market.slug if chosen_market is not None else None,
+            market_end_time=chosen_market.end_time if chosen_market is not None else None,
+            entry_price=chosen_signal.price,
+            requested_amount_usdc=float(order_amount),
         )
         state_store.save(state)
         return 0
@@ -552,6 +794,10 @@ def execute_cycle(config: BotConfig) -> int:
         question=chosen_signal.question,
         outcome=chosen_signal.outcome,
         strategy_name=chosen_signal.strategy_name,
+        market_slug=chosen_market.slug if chosen_market is not None else None,
+        market_end_time=chosen_market.end_time if chosen_market is not None else None,
+        entry_price=chosen_signal.price,
+        requested_amount_usdc=float(order_amount),
     )
     state_store.save(state)
     try:
@@ -566,13 +812,21 @@ def execute_cycle(config: BotConfig) -> int:
         )
         state_store.save(state)
         LOGGER.warning(
-            "Live order skipped: no executable liquidity for $%.2f of %s (%s) at the time of submission.",
-            float(order_amount),
-            chosen_signal.outcome,
-            chosen_signal.question,
+            "Trade skipped | no executable liquidity | %s",
+            _trade_label(
+                question=chosen_signal.question,
+                outcome=chosen_signal.outcome,
+                strategy_name=chosen_signal.strategy_name,
+            ),
         )
+        _log_session_status(state)
         return 0
-    LOGGER.info("Live order response: %s", response)
+    LOGGER.debug("Live order response: %s", response)
+    filled_shares = _as_float(response.get("takingAmount"))
+    filled_cost = _as_float(response.get("makingAmount"))
+    average_entry_price = None
+    if filled_shares is not None and filled_cost is not None and filled_shares > 0:
+        average_entry_price = filled_cost / filled_shares
     state_store.update_trade_mode(
         state,
         condition_id=chosen_signal.condition_id,
@@ -580,7 +834,20 @@ def execute_cycle(config: BotConfig) -> int:
         placed_at=now,
         mode="live",
     )
+    state_store.update_trade_fields(
+        state,
+        condition_id=chosen_signal.condition_id,
+        token_id=chosen_signal.token_id,
+        placed_at=now,
+        order_id=response.get("orderID"),
+        fill_status=response.get("status"),
+        filled_shares=filled_shares,
+        filled_cost_usdc=filled_cost,
+        average_entry_price=average_entry_price,
+        fill_transaction_hashes=response.get("transactionsHashes"),
+    )
     state_store.save(state)
+    _log_trade_opened(signal=chosen_signal, response=response, state=state)
     return 0
 
 
@@ -600,26 +867,58 @@ def _refresh_settled_trades(
     if not unsettled:
         return
 
+    unresolved_by_condition: dict[str, Market] = {}
+    unresolved_without_slug: list[dict[str, object]] = []
+    for trade in unsettled:
+        market_slug = str(trade.get("market_slug") or "").strip()
+        if not market_slug:
+            unresolved_without_slug.append(trade)
+            continue
+        try:
+            event_markets = gamma_client.fetch_event_market_models(market_slug)
+        except Exception:  # noqa: BLE001
+            unresolved_without_slug.append(trade)
+            continue
+        matched_market = next(
+            (
+                market
+                for market in event_markets
+                if market.condition_id == str(trade.get("condition_id") or "")
+            ),
+            None,
+        )
+        if matched_market is None:
+            unresolved_without_slug.append(trade)
+            continue
+        unresolved_by_condition[matched_market.condition_id] = matched_market
+
     oldest_placed_at = min(
         datetime.fromisoformat(str(trade["placed_at"])).astimezone(timezone.utc)
         for trade in unsettled
     )
     age_seconds = max(0.0, (now - oldest_placed_at).total_seconds())
     lookback_days = max(1, ceil(age_seconds / 86400) + 1)
-    limit = max(config.market_limit, len(unsettled) * 2, 50)
-    closed_markets = gamma_client.fetch_recent_closed_btc_updown_5m_markets(
-        limit=limit,
-        days=lookback_days,
-        now=now,
-    )
-    markets_by_condition = {
-        market.condition_id: market
-        for market in closed_markets
-    }
+    if unresolved_without_slug:
+        estimated_recent_closes = ceil(age_seconds / 300) + 20
+        limit = min(
+            config.market_limit,
+            max(len(unresolved_without_slug) * 2, estimated_recent_closes, 20),
+        )
+        closed_markets = gamma_client.fetch_recent_closed_btc_updown_5m_markets(
+            limit=limit,
+            days=lookback_days,
+            now=now,
+        )
+        unresolved_by_condition.update(
+            {
+                market.condition_id: market
+                for market in closed_markets
+            }
+        )
     updated = False
 
     for trade in unsettled:
-        market = markets_by_condition.get(str(trade.get("condition_id") or ""))
+        market = unresolved_by_condition.get(str(trade.get("condition_id") or ""))
         if market is None:
             continue
         settlement_price = next(
@@ -646,14 +945,7 @@ def _refresh_settled_trades(
         )
         updated = changed or updated
         if changed:
-            LOGGER.info(
-                "Settled prior %s trade | [%s] %s / %s | result=%s",
-                trade.get("mode"),
-                trade.get("strategy_name", "unknown"),
-                trade.get("question", trade.get("condition_id")),
-                trade.get("outcome", trade.get("token_id")),
-                result,
-            )
+            _log_trade_result(trade=trade, state=state)
 
     if updated:
         state_store.save(state)
@@ -729,9 +1021,12 @@ def _process_claims(
             updated = changed or updated
             if changed:
                 LOGGER.info(
-                    "Auto-claim confirmed | %s / %s | tx=%s",
-                    trade.get("question", trade.get("condition_id")),
-                    trade.get("outcome", trade.get("token_id")),
+                    "Claim confirmed | %s | tx=%s",
+                    _trade_label(
+                        question=trade.get("question", trade.get("condition_id")),
+                        outcome=trade.get("outcome", trade.get("token_id")),
+                        strategy_name=trade.get("strategy_name"),
+                    ),
                     tx_hash,
                 )
         elif state_value in {"STATE_FAILED", "STATE_INVALID"}:
@@ -747,9 +1042,12 @@ def _process_claims(
             updated = changed or updated
             if changed:
                 LOGGER.warning(
-                    "Auto-claim failed | %s / %s | state=%s tx=%s",
-                    trade.get("question", trade.get("condition_id")),
-                    trade.get("outcome", trade.get("token_id")),
+                    "Claim failed | %s | state=%s tx=%s",
+                    _trade_label(
+                        question=trade.get("question", trade.get("condition_id")),
+                        outcome=trade.get("outcome", trade.get("token_id")),
+                        strategy_name=trade.get("strategy_name"),
+                    ),
                     state_value,
                     tx_hash,
                 )
@@ -792,9 +1090,12 @@ def _process_claims(
         updated = changed or updated
         if changed:
             LOGGER.info(
-                "Auto-claim submitted | %s / %s | transaction_id=%s tx=%s",
-                trade.get("question", trade.get("condition_id")),
-                trade.get("outcome", trade.get("token_id")),
+                "Claim submitted | %s | transaction_id=%s tx=%s",
+                _trade_label(
+                    question=trade.get("question", trade.get("condition_id")),
+                    outcome=trade.get("outcome", trade.get("token_id")),
+                    strategy_name=trade.get("strategy_name"),
+                ),
                 submission.transaction_id,
                 submission.transaction_hash,
             )
@@ -841,7 +1142,7 @@ def _raise_if_loss_streak_triggered(*, config: BotConfig, state) -> None:
 
 
 def _log_signal(signal: TradeSignal, config: BotConfig, *, order_amount: float) -> None:
-    LOGGER.info(
+    LOGGER.debug(
         "Selected [%s] %s / %s | score=%.3f price=%.3f spread=%.3f expiry=%.2fm liquidity=%.2f | %s",
         signal.strategy_name,
         signal.question,
@@ -853,7 +1154,7 @@ def _log_signal(signal: TradeSignal, config: BotConfig, *, order_amount: float) 
         signal.liquidity,
         signal.reason,
     )
-    LOGGER.info(
+    LOGGER.debug(
         "Mode: strategy=%s dry_run=%s live_enabled=%s amount=$%.2f sizing=%s",
         config.strategy_name,
         config.dry_run,
@@ -1188,6 +1489,7 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
     config = BotConfig.from_env()
+    explicit_log_path = os.getenv("POLYMARKET_LOG_PATH") is not None
     if args.strategy is not None:
         if args.command in {"run", "run-once", "doctor"} and args.strategy in BACKTEST_ONLY_STRATEGIES:
             parser.error(
@@ -1198,6 +1500,14 @@ def main() -> int:
         config = replace(config, late_leader_horizon_seconds=args.late_leader_seconds)
     if args.late_leader_window_seconds is not None:
         config = replace(config, late_leader_window_seconds=args.late_leader_window_seconds)
+    config = replace(
+        config,
+        log_path=_resolve_command_log_path(
+            command=args.command,
+            configured_log_path=config.log_path,
+            explicit_override=explicit_log_path,
+        ),
+    )
     configure_logging(
         args.verbose,
         log_path=config.log_path,
@@ -1216,6 +1526,7 @@ def main() -> int:
     if args.command == "run-once":
         try:
             with execution_lock(config.lock_path):
+                _log_runtime_banner(config)
                 return execute_cycle(config)
         except StrategyGuardTriggered as exc:
             LOGGER.error("%s", exc)
@@ -1277,10 +1588,11 @@ def main() -> int:
 
     try:
         with execution_lock(config.lock_path):
+            _log_runtime_banner(config)
             while True:
+                cycle_started = time.monotonic()
                 try:
                     execute_cycle(config)
-                    time.sleep(config.scan_interval_seconds)
                 except StrategyGuardTriggered as exc:
                     LOGGER.error("%s", exc)
                     return 1
@@ -1289,7 +1601,16 @@ def main() -> int:
                     return 0
                 except Exception as exc:  # noqa: BLE001
                     LOGGER.exception("Cycle failed: %s", exc)
-                    time.sleep(config.scan_interval_seconds)
+                delay = _cycle_sleep_seconds(
+                    started_at_monotonic=cycle_started,
+                    interval_seconds=config.scan_interval_seconds,
+                )
+                try:
+                    if delay > 0:
+                        time.sleep(delay)
+                except KeyboardInterrupt:
+                    LOGGER.info("Stopping bot loop.")
+                    return 0
     except RuntimeError as exc:
         LOGGER.error("%s", exc)
         return 1

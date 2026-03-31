@@ -284,6 +284,13 @@ class GammaClient:
                 return markets if isinstance(markets, list) else []
         return []
 
+    def fetch_event_market_models(self, slug: str) -> list[Market]:
+        return [
+            market
+            for item in self.fetch_event_markets(slug)
+            if (market := self._normalize_market(item)) is not None
+        ]
+
     def _normalize_market(self, item: dict[str, object]) -> Market | None:
         condition_id = str(item.get("conditionId") or "").strip()
         question = str(item.get("question") or "").strip()

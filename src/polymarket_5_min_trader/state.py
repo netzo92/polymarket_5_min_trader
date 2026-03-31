@@ -79,6 +79,10 @@ class BotStateStore:
         question: str | None = None,
         outcome: str | None = None,
         strategy_name: str | None = None,
+        market_slug: str | None = None,
+        market_end_time: datetime | None = None,
+        entry_price: float | None = None,
+        requested_amount_usdc: float | None = None,
     ) -> None:
         trade: dict[str, object] = {
             "condition_id": condition_id,
@@ -92,6 +96,14 @@ class BotStateStore:
             trade["outcome"] = outcome
         if strategy_name:
             trade["strategy_name"] = strategy_name
+        if market_slug:
+            trade["market_slug"] = market_slug
+        if market_end_time:
+            trade["market_end_time"] = market_end_time.isoformat()
+        if entry_price is not None:
+            trade["entry_price"] = entry_price
+        if requested_amount_usdc is not None:
+            trade["requested_amount_usdc"] = requested_amount_usdc
         state.recent_trades.append(trade)
         cutoff = placed_at - timedelta(hours=12)
         state.recent_trades = [

@@ -1,15 +1,22 @@
 import gzip
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from polymarket_5_min_trader.cli import (
+    _as_float,
     build_parser,
     _collateral_funding_messages,
     _compressed_log_name,
+    _cycle_sleep_seconds,
+    _format_signed_dollars,
     _gzip_rotated_log,
+    _resolve_command_log_path,
     _resolve_order_amount,
+    _summarize_session,
+    _trade_realized_pnl,
     run_autoresearch_command,
     validate_config,
 )
@@ -130,6 +137,126 @@ def test_resolve_order_amount_uses_collateral_percentage() -> None:
     )
 
     assert amount == Decimal("1.23")
+
+
+def test_cycle_sleep_seconds_maintains_start_to_start_scan_interval() -> None:
+    assert _cycle_sleep_seconds(
+        started_at_monotonic=100.0,
+        interval_seconds=1,
+        ended_at_monotonic=100.4,
+    ) == pytest.approx(0.6)
+    assert _cycle_sleep_seconds(
+        started_at_monotonic=100.0,
+        interval_seconds=1,
+        ended_at_monotonic=101.4,
+    ) == 0.0
+
+
+def test_as_float_handles_strings_decimals_and_invalid_values() -> None:
+    assert _as_float("3.14") == pytest.approx(3.14)
+    assert _as_float(Decimal("2.50")) == pytest.approx(2.5)
+    assert _as_float("  ") is None
+    assert _as_float("wat") is None
+
+
+def test_trade_realized_pnl_uses_fill_details_when_available() -> None:
+    winning_trade = {
+        "mode": "live",
+        "filled_cost_usdc": 3.299972,
+        "filled_shares": 3.402033,
+        "settlement_price": 1.0,
+    }
+    losing_trade = {
+        "mode": "live",
+        "filled_cost_usdc": 3.299972,
+        "settlement_price": 0.0,
+    }
+
+    assert _trade_realized_pnl(winning_trade) == pytest.approx(0.102061)
+    assert _trade_realized_pnl(losing_trade) == pytest.approx(-3.299972)
+
+
+def test_summarize_session_counts_trades_results_and_realized_pnl() -> None:
+    state = SimpleNamespace(
+        recent_trades=[
+            {
+                "mode": "live",
+                "result": "win",
+                "settled_at": "2026-03-30T20:05:00+00:00",
+                "filled_cost_usdc": 3.299972,
+                "filled_shares": 3.402033,
+                "settlement_price": 1.0,
+            },
+            {
+                "mode": "live",
+                "result": "loss",
+                "settled_at": "2026-03-30T20:10:00+00:00",
+                "filled_cost_usdc": 3.299972,
+                "settlement_price": 0.0,
+            },
+            {
+                "mode": "live",
+                "filled_cost_usdc": 3.299972,
+            },
+            {
+                "mode": "live-pending",
+            },
+            {
+                "mode": "live-no-match",
+            },
+            {
+                "mode": "live",
+                "result": "win",
+                "settled_at": "2026-03-30T20:15:00+00:00",
+                "filled_cost_usdc": 3.299972,
+                "filled_shares": 3.402033,
+                "settlement_price": 1.0,
+                "claim_state": "submitted",
+            },
+        ]
+    )
+
+    stats = _summarize_session(state)
+
+    assert stats.trades == 4
+    assert stats.wins == 2
+    assert stats.losses == 1
+    assert stats.open_trades == 1
+    assert stats.pending_trades == 1
+    assert stats.no_match_trades == 1
+    assert stats.claim_pending == 1
+    assert stats.realized_pnl == pytest.approx(-3.09585, abs=1e-5)
+
+
+def test_format_signed_dollars_adds_explicit_sign() -> None:
+    assert _format_signed_dollars(1.234) == "+$1.23"
+    assert _format_signed_dollars(-1.234) == "-$1.23"
+
+
+def test_resolve_command_log_path_uses_command_specific_default_when_not_overridden() -> None:
+    assert _resolve_command_log_path(
+        command="download-history",
+        configured_log_path=Path("data/bot.log"),
+        explicit_override=False,
+    ) == Path("data/download-history.log")
+    assert _resolve_command_log_path(
+        command="autoresearch",
+        configured_log_path=Path("data/bot.log"),
+        explicit_override=False,
+    ) == Path("data/autoresearch.log")
+    assert _resolve_command_log_path(
+        command="run",
+        configured_log_path=Path("data/bot.log"),
+        explicit_override=False,
+    ) == Path("data/bot.log")
+
+
+def test_resolve_command_log_path_honors_explicit_override() -> None:
+    assert _resolve_command_log_path(
+        command="download-history",
+        configured_log_path=Path("custom.log"),
+        explicit_override=True,
+    ) == Path("custom.log")
 
 
 def test_build_parser_works_without_optional_research_module() -> None:

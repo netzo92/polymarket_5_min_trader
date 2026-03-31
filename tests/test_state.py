@@ -303,6 +303,110 @@ def test_execute_cycle_uses_dynamic_order_size_pct_for_live_orders(
     assert placed["amount"] == 1.23
 
 
+def test_execute_cycle_persists_live_fill_details_for_session_pnl(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_path = tmp_path / "state.json"
+    config = make_config(state_path)
+    now = datetime(2026, 3, 30, 20, 0, tzinfo=timezone.utc)
+    market = Market(
+        condition_id="0xmarket",
+        question="Bitcoin Up or Down - March 30, 4:00PM-4:05PM ET",
+        slug="btc-updown-5m-1774900800",
+        end_time=now + timedelta(minutes=5),
+        liquidity=7000,
+        volume=10000,
+        enable_order_book=True,
+        outcomes=(
+            OutcomeMarket("Up", "up-token", 0.97),
+            OutcomeMarket("Down", "down-token", 0.03),
+        ),
+    )
+    signal = TradeSignal(
+        strategy_name="late_leader",
+        condition_id=market.condition_id,
+        token_id="up-token",
+        question=market.question,
+        outcome="Up",
+        price=0.97,
+        spread=0.01,
+        minutes_to_expiry=0.65,
+        momentum_delta=0.20,
+        liquidity=market.liquidity,
+        score=1.0,
+        reason="leader near expiry",
+    )
+
+    class FakeGammaClient:
+        def __init__(self, gamma_url: str) -> None:
+            self.gamma_url = gamma_url
+
+        def fetch_btc_updown_5m_markets(self, *, limit: int, now: datetime) -> list[Market]:
+            return [market]
+
+    class FakePublicClobClient:
+        def __init__(self, host: str, chain_id: int) -> None:
+            self.host = host
+            self.chain_id = chain_id
+
+    class FakeTradingClobClient:
+        def __init__(self, config: BotConfig) -> None:
+            self.config = config
+
+        def place_market_buy(self, token_id: str, amount: float) -> dict:
+            return {
+                "orderID": "0xorder",
+                "takingAmount": "3.402033",
+                "makingAmount": "3.299972",
+                "status": "matched",
+                "transactionsHashes": ["0xtx"],
+                "success": True,
+            }
+
+    monkeypatch.setattr(
+        "polymarket_5_min_trader.cli.datetime",
+        type(
+            "FakeDateTime",
+            (),
+            {
+                "now": staticmethod(lambda tz=None: now),
+                "fromisoformat": staticmethod(datetime.fromisoformat),
+            },
+        ),
+    )
+    monkeypatch.setattr("polymarket_5_min_trader.cli.GammaClient", FakeGammaClient)
+    monkeypatch.setattr("polymarket_5_min_trader.cli.PublicClobClient", FakePublicClobClient)
+    monkeypatch.setattr(
+        "polymarket_5_min_trader.cli.filter_tradeable_markets",
+        lambda markets, *, config, now, strategy_name=None: markets,
+    )
+    monkeypatch.setattr(
+        "polymarket_5_min_trader.cli.collect_token_metrics",
+        lambda markets, public_client: {},
+    )
+    monkeypatch.setattr(
+        "polymarket_5_min_trader.cli.build_trade_signals",
+        lambda markets, token_metrics, state, *, config, now, strategy_name=None: [signal],
+    )
+    monkeypatch.setattr("polymarket_5_min_trader.cli.TradingClobClient", FakeTradingClobClient)
+
+    result = execute_cycle(config)
+
+    assert result == 0
+    reloaded = BotStateStore(state_path).load()
+    trade = reloaded.recent_trades[0]
+    assert trade["mode"] == "live"
+    assert trade["entry_price"] == pytest.approx(0.97)
+    assert trade["requested_amount_usdc"] == pytest.approx(5.0)
+    assert trade["filled_cost_usdc"] == pytest.approx(3.299972)
+    assert trade["filled_shares"] == pytest.approx(3.402033)
+    assert trade["average_entry_price"] == pytest.approx(3.299972 / 3.402033)
+    assert trade["fill_status"] == "matched"
+    assert trade["order_id"] == "0xorder"
+    assert trade["fill_transaction_hashes"] == ["0xtx"]
+
+
 def test_execute_cycle_submits_claim_for_settled_live_winner(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -499,6 +603,94 @@ def test_execute_cycle_refreshes_settlements_even_without_loss_guard(
     assert trade["claim_transaction_hash"] == "0xrefreshhash"
 
 
+def test_execute_cycle_refreshes_settlement_via_trade_slug_without_broad_closed_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_path = tmp_path / "state.json"
+    config = make_config(state_path)
+    now = datetime(2026, 3, 30, 20, 10, tzinfo=timezone.utc)
+    placed_at = now - timedelta(minutes=7)
+    condition_id = "0x" + ("aa" * 32)
+    market_slug = "btc-updown-5m-1774900800"
+    store = BotStateStore(state_path)
+    state = store.load()
+    store.remember_trade(
+        state,
+        condition_id=condition_id,
+        token_id="down-token",
+        placed_at=placed_at,
+        mode="live",
+        question="Bitcoin Up or Down - March 30, 4:00PM-4:05PM ET",
+        outcome="Down",
+        strategy_name="late_leader",
+        market_slug=market_slug,
+        market_end_time=now - timedelta(minutes=2),
+    )
+    store.save(state)
+
+    closed_market = Market(
+        condition_id=condition_id,
+        question="Bitcoin Up or Down - March 30, 4:00PM-4:05PM ET",
+        slug=market_slug,
+        end_time=now - timedelta(minutes=2),
+        liquidity=7000,
+        volume=10000,
+        enable_order_book=True,
+        closed=True,
+        outcomes=(
+            OutcomeMarket("Up", "up-token", 0.0, settlement_price=0.0),
+            OutcomeMarket("Down", "down-token", 1.0, settlement_price=1.0),
+        ),
+    )
+
+    class FakeDateTime:
+        @staticmethod
+        def now(tz=None):
+            return now
+
+        @staticmethod
+        def fromisoformat(value: str):
+            return datetime.fromisoformat(value)
+
+    class FakeGammaClient:
+        def __init__(self, gamma_url: str) -> None:
+            self.gamma_url = gamma_url
+
+        def fetch_event_market_models(self, slug: str) -> list[Market]:
+            assert slug == market_slug
+            return [closed_market]
+
+        def fetch_recent_closed_btc_updown_5m_markets(
+            self,
+            *,
+            limit: int,
+            days: int,
+            now: datetime | None = None,
+        ) -> list[Market]:
+            raise AssertionError("broad closed market scan should not run when trade slug is known")
+
+        def fetch_btc_updown_5m_markets(self, *, limit: int, now: datetime) -> list[Market]:
+            return []
+
+    class FakePublicClobClient:
+        def __init__(self, host: str, chain_id: int) -> None:
+            self.host = host
+            self.chain_id = chain_id
+
+    monkeypatch.setattr("polymarket_5_min_trader.cli.datetime", FakeDateTime)
+    monkeypatch.setattr("polymarket_5_min_trader.cli.GammaClient", FakeGammaClient)
+    monkeypatch.setattr("polymarket_5_min_trader.cli.PublicClobClient", FakePublicClobClient)
+
+    result = execute_cycle(config)
+
+    assert result == 0
+    reloaded = BotStateStore(state_path).load()
+    trade = reloaded.recent_trades[0]
+    assert trade["result"] == "win"
+    assert trade["settlement_price"] == 1.0
+
+
 def test_execute_cycle_confirms_submitted_claim(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -673,7 +865,7 @@ def test_execute_cycle_treats_no_match_as_warning(
         result = execute_cycle(config)
 
     assert result == 0
-    assert "Live order skipped" in caplog.text
+    assert "Trade skipped | no executable liquidity" in caplog.text
     reloaded = BotStateStore(state_path).load()
     assert len(reloaded.recent_trades) == 1
     assert reloaded.recent_trades[0]["mode"] == "live-no-match"
