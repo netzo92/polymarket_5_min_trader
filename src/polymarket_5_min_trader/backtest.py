@@ -370,30 +370,40 @@ def _simulate_late_leader_market(
 
     end_ts = int(market.end_time.timestamp())
     cutoff_ts = end_ts - horizon_seconds
-    latest_by_token: dict[str, tuple[int, float]] = {}
-    for token_id, rows in bundle.price_history.items():
-        latest: tuple[int, float] | None = None
-        for row in rows:
-            price = row.get("p")
-            timestamp = row.get("t")
-            if price is None or timestamp is None:
-                continue
-            ts = int(timestamp)
-            if ts > cutoff_ts:
-                continue
-            candidate = (ts, float(price))
-            if latest is None or ts >= latest[0]:
-                latest = candidate
-        if latest is not None:
-            latest_by_token[token_id] = latest
 
-    if len(latest_by_token) < 2:
+    def _leader_at_cutoff(ts_limit: int) -> tuple[str | None, dict[str, tuple[int, float]]]:
+        by_token: dict[str, tuple[int, float]] = {}
+        for tid, rows in bundle.price_history.items():
+            latest: tuple[int, float] | None = None
+            for row in rows:
+                price = row.get("p")
+                timestamp = row.get("t")
+                if price is None or timestamp is None:
+                    continue
+                ts = int(timestamp)
+                if ts > ts_limit:
+                    continue
+                candidate = (ts, float(price))
+                if latest is None or ts >= latest[0]:
+                    latest = candidate
+            if latest is not None:
+                by_token[tid] = latest
+        if len(by_token) < 2:
+            return None, by_token
+        leader = max(by_token.items(), key=lambda item: (item[1][1], item[1][0]))
+        return leader[0], by_token
+
+    leader_id, latest_by_token = _leader_at_cutoff(cutoff_ts)
+    if leader_id is None:
         return None
 
-    token_id, (entry_ts, observed_entry_price) = max(
-        latest_by_token.items(),
-        key=lambda item: (item[1][1], item[1][0]),
-    )
+    confirm_cutoff = end_ts - max(horizon_seconds + 20, 60)
+    confirm_leader_id, _ = _leader_at_cutoff(confirm_cutoff)
+    if confirm_leader_id is not None and confirm_leader_id != leader_id:
+        return None
+
+    token_id = leader_id
+    entry_ts, observed_entry_price = latest_by_token[token_id]
     if observed_entry_price <= 0:
         return None
 
