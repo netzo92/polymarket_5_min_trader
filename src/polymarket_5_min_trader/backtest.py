@@ -385,16 +385,10 @@ def _simulate_late_leader_market(
     if len(latest_by_token) < 2:
         return None
 
-    ranked = sorted(
+    token_id, (entry_ts, observed_entry_price) = max(
         latest_by_token.items(),
         key=lambda item: (item[1][1], item[1][0]),
-        reverse=True,
     )
-    token_id, (entry_ts, observed_entry_price) = ranked[0]
-    runner_up_price = ranked[1][1][1]
-    price_gap = observed_entry_price - runner_up_price
-    if price_gap < 0.20:
-        return None
     if observed_entry_price <= 0:
         return None
 
